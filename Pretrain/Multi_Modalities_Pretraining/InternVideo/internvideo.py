@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import decord
+import math
 
 from typing import Any, OrderedDict, Union, List
 from pkg_resources import packaging
@@ -11,7 +12,7 @@ from .simple_tokenizer import SimpleTokenizer as _Tokenizer
 from .clip_utils.model import build_model
 
 
-__all__ = ["load_model", "load_video", "tokenize"]
+__all__ = ["load_model", "load_video", "tokenize", "load_video_batch"]
 _tokenizer = _Tokenizer()
 
 
@@ -24,24 +25,85 @@ def load_model(path):
 
 def load_video(path):
     video_reader = decord.VideoReader(path, num_threads=1, ctx=decord.cpu(0))
-    decord.bridge.set_bridge('torch')
+    decord.bridge.set_bridge("torch")
     video_len = len(video_reader)
-    video = video_reader.get_batch(np.linspace(0, video_len - 1, 8).astype(np.intc)).byte()
+    video = video_reader.get_batch(
+        np.linspace(0, video_len - 1, 8).astype(np.intc)
+    ).byte()
     video = video.permute(3, 0, 1, 2)
 
     input_mean = [0.48145466, 0.4578275, 0.40821073]
     input_std = [0.26862954, 0.26130258, 0.27577711]
     crop_size, scale_size = 224, 256
-    trans = transforms.Compose([
-        video_transform.TensorToNumpy(),
-        video_transform.Resize(scale_size),
-        video_transform.CenterCrop(crop_size),
-        video_transform.ClipToTensor(channel_nb=3),
-        video_transform.Normalize(mean=input_mean, std=input_std)
-    ])
+    trans = transforms.Compose(
+        [
+            video_transform.TensorToNumpy(),
+            video_transform.Resize(scale_size),
+            video_transform.CenterCrop(crop_size),
+            video_transform.ClipToTensor(channel_nb=3),
+            video_transform.Normalize(mean=input_mean, std=input_std),
+        ]
+    )
 
     video = trans(video)
     return video
+
+
+def load_video_batch(path):
+    video_reader = decord.VideoReader(path, num_threads=1, ctx=decord.cpu(0))
+    decord.bridge.set_bridge("torch")
+
+    # Get video frame rate
+    fps = video_reader.get_avg_fps()
+    video_len = len(video_reader)
+
+    # Compute the frame indices for 8 frames per second
+    frame_indices_per_second = np.arange(0, fps, fps / 8).astype(np.int)
+
+    # Calculate the number of batches needed, considering even the incomplete batches
+    total_batches = math.ceil(video_len / fps)
+
+    batched_videos = []
+    for batch in range(total_batches):
+        start_frame = batch * fps
+        indices = (frame_indices_per_second + start_frame).astype(np.intc)
+
+        # Ensure indices are within bounds of the video length
+        valid_indices = indices[indices < video_len]
+
+        # Check if padding is needed
+        pad_length = len(indices) - len(valid_indices)
+
+        video = video_reader.get_batch(valid_indices).byte()
+
+        # If padding is needed
+        if pad_length > 0:
+            padding = torch.zeros((pad_length, *video.shape[1:]), dtype=torch.uint8)
+            video = torch.cat([video, padding], dim=0)
+
+        # Permute tensor dimensions to (channel, time, height, width)
+        video = video.permute(3, 0, 1, 2)
+
+        input_mean = [0.48145466, 0.4578275, 0.40821073]
+        input_std = [0.26862954, 0.26130258, 0.27577711]
+        crop_size, scale_size = 224, 256
+
+        trans = transforms.Compose(
+            [
+                # Assuming video_transform provides these functions
+                video_transform.TensorToNumpy(),
+                video_transform.Resize(scale_size),
+                video_transform.CenterCrop(crop_size),
+                video_transform.ClipToTensor(channel_nb=3),
+                video_transform.Normalize(mean=input_mean, std=input_std),
+            ]
+        )
+
+        video = trans(video)
+        batched_videos.append(video)
+
+    batched_videos = torch.stack(batched_videos, dim=0)
+    return batched_videos
 
 
 def tokenize(
